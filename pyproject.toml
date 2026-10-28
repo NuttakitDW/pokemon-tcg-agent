@@ -1,0 +1,15 @@
+[project]
+name = "pokemon-tcg-agent"
+version = "0.1.0"
+description = "Local harness for the Kaggle PTCG AI Battle Challenge (cabt engine)"
+requires-python = ">=3.12"
+dependencies = ["kaggle-environments>=1.33.0"]
+
+[dependency-groups]
+dev = ["pytest>=8", "pytest-cov>=5"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+markers = ["slow: plays many real engine matches"]
+addopts = "-m 'not slow'"
