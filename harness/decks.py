@@ -19,7 +19,11 @@ def validate_deck(deck: list[int] | tuple[int, ...]) -> tuple[int, ...]:
 
 
 def load_deck(path: str | Path) -> tuple[int, ...]:
-    lines = [line.strip() for line in Path(path).read_text().splitlines() if line.strip()]
+    try:
+        text = Path(path).read_text()
+    except OSError as exc:
+        raise DeckError(f"{path}: {exc.strerror or exc}") from exc
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
     try:
         cards = [int(line) for line in lines]
     except ValueError as exc:

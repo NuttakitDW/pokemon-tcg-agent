@@ -60,6 +60,33 @@ def test_timed_accumulates_even_when_the_agent_raises():
     assert clock["calls"] == 1 and clock["secs"] >= 0.0
 
 
+def test_a_tarball_is_extracted_once_per_process(tmp_path, monkeypatch):
+    import tempfile
+    from pathlib import Path
+
+    from harness import agents
+    from harness.package import build_submission
+
+    tarball = build_submission(Path("agents/greedy.py"), Path("decks/default.csv"), tmp_path / "s.tar.gz")
+    real_mkdtemp, extractions = tempfile.mkdtemp, []
+    monkeypatch.setattr(agents.tempfile, "mkdtemp", lambda **kw: extractions.append(kw) or real_mkdtemp(**kw))
+
+    first, second = load_agent(str(tarball)), load_agent(str(tarball))
+    assert len(extractions) == 1  # a worker plays many matches; each must not leave its own copy
+    assert first.deck == second.deck and first.fn is not second.fn  # but the agent code is fresh per load
+
+
+def test_timed_keeps_the_slowest_single_call():
+    import time
+
+    delays = iter([0.03, 0.0, 0.0])
+    fn, clock = timed(lambda obs: time.sleep(next(delays)) or [0])
+    for _ in range(3):
+        fn({})
+    assert clock["calls"] == 3
+    assert 0.03 <= clock["max"] <= clock["secs"]
+
+
 def test_sibling_modules_do_not_leak_between_agents(tmp_path):
     # Two agents that each ship a `shared.py` must each get their own.
     for name, value in (("v1", 1), ("v2", 2)):

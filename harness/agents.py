@@ -93,14 +93,28 @@ def _forget_modules_under(folder: Path, keep: set[str]) -> None:
             del sys.modules[name]
 
 
+# One extraction per tarball per process. A worker plays many matches and every load used to leave
+# its own copy until exit, which for a submission with weights is hundreds of MiB per match.
+_EXTRACTED: dict[tuple[str, int, int], Path] = {}
+
+
+def _extract(tarball: Path) -> Path:
+    stat = tarball.stat()
+    key = (str(tarball.resolve()), stat.st_mtime_ns, stat.st_size)
+    if key not in _EXTRACTED:
+        root = Path(tempfile.mkdtemp(prefix="agent-"))
+        atexit.register(shutil.rmtree, root, True)
+        try:
+            with tarfile.open(tarball) as tar:
+                tar.extractall(root, filter="data")
+        except (tarfile.TarError, OSError) as exc:
+            raise AgentLoadError(f"{tarball}: {exc}") from exc
+        _EXTRACTED[key] = root
+    return _EXTRACTED[key]
+
+
 def _load_tarball(tarball: Path) -> LoadedAgent:
-    root = Path(tempfile.mkdtemp(prefix="agent-"))
-    atexit.register(shutil.rmtree, root, True)
-    try:
-        with tarfile.open(tarball) as tar:
-            tar.extractall(root, filter="data")
-    except (tarfile.TarError, OSError) as exc:
-        raise AgentLoadError(f"{tarball}: {exc}") from exc
+    root = _extract(tarball)  # the agent code below is still executed fresh on every load
     if not (root / "main.py").is_file() or not (root / "deck.csv").is_file():
         raise AgentLoadError(f"{tarball} needs main.py and deck.csv at its root")
     loaded = _exec_agent_file(root / "main.py", tarball.name, env={AGENT_ROOT_ENV: str(root)})
@@ -119,15 +133,17 @@ def with_deck(fn: AgentFn, deck: tuple[int, ...]) -> AgentFn:
 
 
 def timed(fn: AgentFn) -> tuple[AgentFn, dict]:
-    """Wrap `fn`; the returned dict accumulates `secs` and `calls` across the match."""
-    clock = {"secs": 0.0, "calls": 0}
+    """Wrap `fn`; the returned dict accumulates `secs` and `calls` and keeps the slowest call as `max`."""
+    clock = {"secs": 0.0, "calls": 0, "max": 0.0}
 
     def agent(obs):
         started = time.perf_counter()
         try:
             return fn(obs)
         finally:
-            clock["secs"] += time.perf_counter() - started
+            elapsed = time.perf_counter() - started
+            clock["secs"] += elapsed
             clock["calls"] += 1
+            clock["max"] = max(clock["max"], elapsed)
 
     return agent, clock

@@ -6,3 +6,4 @@ dist/
 *.tar.gz
 # competition data is licensed for the competition only and must be deleted afterwards
 data/
+runs/

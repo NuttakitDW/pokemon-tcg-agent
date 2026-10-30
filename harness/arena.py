@@ -5,6 +5,7 @@ The cabt engine keeps its game state in process-global memory, so matches run in
 supervised: one that dies (native crash, OOM) or overruns the wall-clock limit is replaced and
 its match is reported as a CRASH instead of hanging the whole run.
 """
+import contextlib
 import hashlib
 import multiprocessing as mp
 import os
@@ -12,8 +13,10 @@ import random
 import time
 import traceback
 from collections import deque
+from collections.abc import Sequence
 from dataclasses import dataclass
 from multiprocessing.connection import wait
+from pathlib import Path
 
 from harness.agents import load_agent, timed, with_deck
 from harness.stats import wilson
@@ -22,6 +25,7 @@ FAULT_STATUSES = frozenset({"INVALID", "ERROR", "TIMEOUT"})
 MATCH_BUDGET_SECS = 600  # per agent per match, enforced by the competition
 DEFAULT_MATCH_TIMEOUT = 2 * MATCH_BUDGET_SECS + 60  # wall clock for a whole match, both agents
 STDERR_TAIL_CHARS = 600
+WORKER_EXIT_SECS = 5  # how long a worker gets to exit after being asked, or after being killed
 
 
 @dataclass(frozen=True)
@@ -33,6 +37,7 @@ class MatchTask:
     seat_a: int  # which engine seat (0 or 1) agent A plays
     bo: int
     seed: int
+    replay_path: str | None = None  # write the engine's HTML replay of this match here
 
 
 @dataclass(frozen=True)
@@ -47,6 +52,10 @@ class MatchResult:
     secs_b: float
     faults: tuple[str, ...]  # e.g. ("A:INVALID",) or ("CRASH",)
     detail: str = ""  # agent stderr tail, or why the worker was lost
+    calls_a: int = 0  # decisions A made, deck selection included
+    max_call_a: float = 0.0  # A's slowest single decision, seconds
+    replay: str = ""  # path of the HTML replay written for this match
+    replay_error: str = ""  # why the replay was not written; the match result still stands
 
 
 @dataclass(frozen=True)
@@ -70,6 +79,21 @@ class ArenaReport:
     max_secs_b: float
     faults: tuple[str, ...]
     fault_detail: str
+    games_won: int = 0  # single games across every match, A's view
+    games_lost: int = 0
+    calls_a: int = 0
+    total_secs_a: float = 0.0
+    max_call_a: float = 0.0
+    results: tuple[MatchResult, ...] = ()
+
+    @property
+    def game_rate(self) -> float:
+        decided = self.games_won + self.games_lost
+        return self.games_won / decided if decided else 0.0
+
+    @property
+    def ms_per_call_a(self) -> float:
+        return 1000 * self.total_secs_a / self.calls_a if self.calls_a else 0.0
 
     @property
     def verdict(self) -> str:
@@ -107,6 +131,26 @@ def _stderr_tail(env, seat: int) -> str:
     return ""
 
 
+def _save_replay(env, path: str | None) -> tuple[str, str]:
+    """Write the engine's own visualizer page for this match as (path, error).
+
+    A replay problem must never cost a finished match its result, so it is reported, not raised.
+    """
+    if not path:
+        return "", ""
+    target = Path(path)
+    partial = target.with_name(target.name + ".part")  # renamed into place, so no half-written replay
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        partial.write_text(env.render(mode="html"), encoding="utf-8")
+        partial.replace(target)
+    except Exception as exc:  # noqa: BLE001
+        with contextlib.suppress(OSError):  # best effort; the error below is the one that matters
+            partial.unlink(missing_ok=True)
+        return "", f"{type(exc).__name__}: {exc}"
+    return path, ""
+
+
 def play_match(task: MatchTask) -> MatchResult:
     """One best-of-`bo` match in the current process."""
     from kaggle_environments import make
@@ -125,6 +169,7 @@ def play_match(task: MatchTask) -> MatchResult:
     seats = [fns[0], fns[1]] if seat_a == 0 else [fns[1], fns[0]]
     env = make("cabt", configuration={"bo": task.bo}, debug=False)
     env.run(seats)
+    replay, replay_error = _save_replay(env, task.replay_path)
 
     labels = ("A", "B") if seat_a == 0 else ("B", "A")
     faulted = [seat for seat, state in enumerate(env.state) if state.status in FAULT_STATUSES]
@@ -148,6 +193,10 @@ def play_match(task: MatchTask) -> MatchResult:
         secs_b=clocks[1]["secs"],
         faults=faults,
         detail=detail,
+        calls_a=clocks[0]["calls"],
+        max_call_a=clocks[0]["max"],
+        replay=replay,
+        replay_error=replay_error,
     )
 
 
@@ -158,6 +207,8 @@ def _crash_result(task: MatchTask, why: str) -> MatchResult:
 def _worker_main(conn) -> None:
     while True:
         task = conn.recv()
+        if task is None:  # asked to stop: return normally so atexit cleanup (extracted tarballs) runs
+            return
         try:
             conn.send(("ok", play_match(task)))
         except Exception:
@@ -181,10 +232,20 @@ def _start_slot(ctx) -> _Slot:
     return _Slot(process, parent)
 
 
-def _retire(slot: _Slot) -> None:
+def _ask_to_stop(slot: _Slot) -> None:
+    try:
+        slot.conn.send(None)
+    except OSError:
+        pass  # pipe already closed: the worker is going down, and _retire kills it if it is not
+
+
+def _retire(slot: _Slot, *, grace: float = 0.0) -> None:
+    """Stop a worker; `grace` is how long a worker asked to stop gets to exit on its own."""
+    if grace:
+        slot.process.join(timeout=grace)
     if slot.process.is_alive():
         slot.process.kill()
-    slot.process.join(timeout=5)
+    slot.process.join(timeout=WORKER_EXIT_SECS)
     slot.conn.close()
 
 
@@ -226,8 +287,11 @@ def run_supervised(tasks: list[MatchTask], procs: int, timeout: float) -> list[M
                     _retire(slot)
                     slots[position] = _start_slot(ctx)
     finally:
+        idle = [slot for slot in slots if slot.index is None]  # busy ones were interrupted: no mercy
+        for slot in idle:
+            _ask_to_stop(slot)
         for slot in slots:
-            _retire(slot)
+            _retire(slot, grace=WORKER_EXIT_SECS if slot in idle else 0.0)
     return [results[i] for i in range(len(tasks))]
 
 
@@ -265,6 +329,12 @@ def summarize(
         max_secs_b=max((r.secs_b for r in results), default=0.0),
         faults=tuple(sorted({f for r in results for f in r.faults})),
         fault_detail=next((r.detail for r in results if r.detail), ""),
+        games_won=sum(r.games_a for r in results),
+        games_lost=sum(r.games_b for r in results),
+        calls_a=sum(r.calls_a for r in results),
+        total_secs_a=sum(r.secs_a for r in results),
+        max_call_a=max((r.max_call_a for r in results), default=0.0),
+        results=tuple(results),
     )
 
 
@@ -279,14 +349,19 @@ def run_arena(
     bo: int = 3,
     seed: int = 0,
     match_timeout: float = DEFAULT_MATCH_TIMEOUT,
+    replay_paths: Sequence[Path] = (),
 ) -> ArenaReport:
     """Seats alternate every match so first-seat effects cancel out.
 
     `procs=0` plays in this process (handy under a debugger; a crash then takes the run with it).
+    `replay_paths` saves an HTML replay of the first len(replay_paths) matches, one file each.
     """
     loaded_a, loaded_b = load_agent(spec_a), load_agent(spec_b)  # fail fast on a bad spec
     tasks = [
-        MatchTask(spec_a, spec_b, deck_a, deck_b, i % 2, bo, seed * 1_000_003 + i)
+        MatchTask(
+            spec_a, spec_b, deck_a, deck_b, i % 2, bo, seed * 1_000_003 + i,
+            str(replay_paths[i]) if i < len(replay_paths) else None,
+        )
         for i in range(matches)
     ]
     results = (

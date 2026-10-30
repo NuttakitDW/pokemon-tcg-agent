@@ -27,6 +27,13 @@ def test_deck_roundtrip(tmp_path):
     assert load_deck(tmp_path / "deck.csv") == deck
 
 
+def test_load_deck_reports_a_missing_or_unreadable_file_as_a_deck_error(tmp_path):
+    with pytest.raises(DeckError, match="nope.csv"):
+        load_deck(tmp_path / "nope.csv")
+    with pytest.raises(DeckError):
+        load_deck(tmp_path)  # a directory
+
+
 def test_load_deck_ignores_blank_lines(tmp_path):
     path = tmp_path / "deck.csv"
     path.write_text("\n".join(["3"] * 60) + "\n\n\n")

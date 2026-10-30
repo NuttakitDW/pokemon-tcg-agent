@@ -117,6 +117,94 @@ def test_arena_plays_a_packaged_tarball(tmp_path):
     assert report.faults == () and report.deck_a == deck_id(default_deck())
 
 
+def test_match_reports_decision_count_and_slowest_call():
+    result = play_match(MatchTask("random", "random", None, None, 0, 3, 1))
+    assert result.calls_a > 1  # deck selection plus at least one decision
+    assert 0.0 <= result.max_call_a <= result.secs_a
+
+
+def test_replay_is_written_only_when_asked(tmp_path):
+    plain = play_match(MatchTask("random", "random", None, None, 0, 1, 5))
+    assert plain.replay == "" and plain.replay_error == ""
+
+    target = tmp_path / "nested" / "match.html"
+    result = play_match(MatchTask("random", "random", None, None, 0, 1, 5, str(target)))
+    assert result.replay == str(target) and result.replay_error == ""
+    html = target.read_text(encoding="utf-8")
+    assert "window.kaggle" in html and '"name": "cabt"' in html  # the engine's own viewer page
+
+
+def test_unwritable_replay_is_reported_without_losing_the_match(tmp_path):
+    blocker = tmp_path / "file"
+    blocker.write_text("not a directory")
+    result = play_match(MatchTask("random", "random", None, None, 0, 1, 6, str(blocker / "m.html")))
+    assert result.replay == "" and result.replay_error
+    assert result.faults == () and result.outcome != "crash"
+
+
+def test_failed_replay_write_leaves_no_partial_file_behind(tmp_path, monkeypatch):
+    real_write_text = Path.write_text
+
+    def half_then_full_disk(self, data, *args, **kwargs):
+        real_write_text(self, data[: len(data) // 2], *args, **kwargs)
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(Path, "write_text", half_then_full_disk)
+    result = play_match(MatchTask("random", "random", None, None, 0, 1, 7, str(tmp_path / "m.html")))
+    assert result.replay == "" and "No space left" in result.replay_error
+    assert result.faults == () and list(tmp_path.iterdir()) == []
+
+
+def test_workers_leave_no_extracted_tarballs_behind(tmp_path, monkeypatch):
+    from harness.arena import run_supervised
+    from harness.package import build_submission
+
+    tarball = build_submission(Path("agents/greedy.py"), Path("decks/default.csv"), tmp_path / "s.tar.gz")
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    monkeypatch.setenv("TMPDIR", str(scratch))  # inherited by the spawned workers
+    tasks = [MatchTask(str(tarball), "random", None, None, i % 2, 1, i) for i in range(6)]
+    results = run_supervised(tasks, procs=2, timeout=120)
+    assert all(r.outcome != "crash" for r in results)
+    assert list(scratch.glob("agent-*")) == []
+
+
+def test_run_arena_saves_replays_for_the_first_matches_only(tmp_path):
+    paths = [tmp_path / "m0.html", tmp_path / "m1.html"]
+    report = run_arena("random", "first", 3, procs=0, replay_paths=paths)
+    assert [r.replay for r in report.results] == [str(paths[0]), str(paths[1]), ""]
+    assert all(p.stat().st_size > 0 for p in paths)
+
+
+def test_replays_are_written_by_worker_processes(tmp_path):
+    path = tmp_path / "m0.html"
+    report = run_arena("random", "first", 2, procs=2, replay_paths=[path])
+    assert report.crashes == 0 and path.exists()
+    assert report.results[0].replay == str(path)
+
+
+def test_summarize_aggregates_games_decisions_and_latency():
+    from harness.arena import MatchResult
+
+    results = [
+        MatchResult(0, "win", 2, 1, 0, 10, 1.0, 0.0, (), calls_a=100, max_call_a=0.05),
+        MatchResult(1, "loss", 0, 2, 0, 8, 3.0, 0.0, (), calls_a=300, max_call_a=0.2),
+        MatchResult(0, "crash", 0, 0, 0, 0, 0.0, 0.0, ("CRASH",), "worker died"),
+    ]
+    report = summarize("a", "b", results)
+    assert (report.games_won, report.games_lost) == (2, 3)
+    assert report.game_rate == pytest.approx(0.4)
+    assert report.calls_a == 400 and report.total_secs_a == pytest.approx(4.0)
+    assert report.ms_per_call_a == pytest.approx(10.0)
+    assert report.max_call_a == pytest.approx(0.2)
+    assert report.results == tuple(results)
+
+
+def test_summarize_without_decisions_does_not_divide_by_zero():
+    report = summarize("a", "b", [])
+    assert report.game_rate == 0.0 and report.ms_per_call_a == 0.0
+
+
 def test_deck_id_distinguishes_decks_and_marks_agent_chosen():
     assert deck_id(None) == "agent-chosen"
     assert deck_id(default_deck()) != deck_id(tuple([3] * 60))
